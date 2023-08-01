@@ -5,13 +5,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers import DDIMScheduler, DDPMScheduler, StableDiffusionPipeline
 from diffusers.utils.import_utils import is_xformers_available
-from tqdm import tqdm
 
 import threestudio
-from threestudio.models.prompt_processors.base import PromptProcessorOutput
 from threestudio.utils.base import BaseObject
-from threestudio.utils.misc import C, cleanup, parse_version
-from threestudio.utils.ops import perpendicular_component
+from threestudio.utils.misc import C, parse_version
+from threestudio.utils.ops import SpecifyGradient
 from threestudio.utils.typing import *
 
 
@@ -32,8 +30,6 @@ class StableDiffusionGuidance(BaseObject):
 
         min_step_percent: float = 0.02
         max_step_percent: float = 0.98
-        max_step_percent_annealed: float = 0.5
-        anneal_start_step: Optional[int] = None
 
         use_sjc: bool = False
         var_red: bool = True
@@ -41,11 +37,6 @@ class StableDiffusionGuidance(BaseObject):
 
         token_merging: bool = False
         token_merging_params: Optional[dict] = field(default_factory=dict)
-
-        view_dependent_prompting: bool = True
-
-        """Maximum number of batch items to evaluate guidance for (for debugging) and to save on disk. -1 means save all items."""
-        max_items_eval: int = 4
 
     cfg: Config
 
@@ -89,12 +80,9 @@ class StableDiffusionGuidance(BaseObject):
         if self.cfg.enable_channels_last_format:
             self.pipe.unet.to(memory_format=torch.channels_last)
 
-        del self.pipe.text_encoder
-        cleanup()
-
         # Create model
-        self.vae = self.pipe.vae.eval()
-        self.unet = self.pipe.unet.eval()
+        self.vae = self.pipe.vae
+        self.unet = self.pipe.unet
 
         for p in self.vae.parameters():
             p.requires_grad_(False)
@@ -124,7 +112,8 @@ class StableDiffusionGuidance(BaseObject):
             )
 
         self.num_train_timesteps = self.scheduler.config.num_train_timesteps
-        self.set_min_max_steps()  # set to default value
+        self.min_step = int(self.num_train_timesteps * self.cfg.min_step_percent)
+        self.max_step = int(self.num_train_timesteps * self.cfg.max_step_percent)
 
         self.alphas: Float[Tensor, "..."] = self.scheduler.alphas_cumprod.to(
             self.device
@@ -136,11 +125,6 @@ class StableDiffusionGuidance(BaseObject):
         self.grad_clip_val: Optional[float] = None
 
         threestudio.info(f"Loaded Stable Diffusion!")
-
-    @torch.cuda.amp.autocast(enabled=False)
-    def set_min_max_steps(self, min_step_percent=0.02, max_step_percent=0.98):
-        self.min_step = int(self.num_train_timesteps * min_step_percent)
-        self.max_step = int(self.num_train_timesteps * max_step_percent)
 
     @torch.cuda.amp.autocast(enabled=False)
     def forward_unet(
@@ -185,70 +169,27 @@ class StableDiffusionGuidance(BaseObject):
     def compute_grad_sds(
         self,
         latents: Float[Tensor, "B 4 64 64"],
+        text_embeddings: Float[Tensor, "BB 77 768"],
         t: Int[Tensor, "B"],
-        prompt_utils: PromptProcessorOutput,
-        elevation: Float[Tensor, "B"],
-        azimuth: Float[Tensor, "B"],
-        camera_distances: Float[Tensor, "B"],
     ):
-        batch_size = elevation.shape[0]
-
-        if prompt_utils.use_perp_neg:
-            (
-                text_embeddings,
-                neg_guidance_weights,
-            ) = prompt_utils.get_text_embeddings_perp_neg(
-                elevation, azimuth, camera_distances, self.cfg.view_dependent_prompting
+        # predict the noise residual with unet, NO grad!
+        with torch.no_grad():
+            # add noise
+            noise = torch.randn_like(latents)  # TODO: use torch generator
+            latents_noisy = self.scheduler.add_noise(latents, noise, t)
+            # pred noise
+            latent_model_input = torch.cat([latents_noisy] * 2, dim=0)
+            noise_pred = self.forward_unet(
+                latent_model_input,
+                torch.cat([t] * 2),
+                encoder_hidden_states=text_embeddings,
             )
-            with torch.no_grad():
-                noise = torch.randn_like(latents)
-                latents_noisy = self.scheduler.add_noise(latents, noise, t)
-                latent_model_input = torch.cat([latents_noisy] * 4, dim=0)
-                noise_pred = self.forward_unet(
-                    latent_model_input,
-                    torch.cat([t] * 4),
-                    encoder_hidden_states=text_embeddings,
-                )  # (4B, 3, 64, 64)
 
-            noise_pred_text = noise_pred[:batch_size]
-            noise_pred_uncond = noise_pred[batch_size : batch_size * 2]
-            noise_pred_neg = noise_pred[batch_size * 2 :]
-
-            e_pos = noise_pred_text - noise_pred_uncond
-            accum_grad = 0
-            n_negative_prompts = neg_guidance_weights.shape[-1]
-            for i in range(n_negative_prompts):
-                e_i_neg = noise_pred_neg[i::n_negative_prompts] - noise_pred_uncond
-                accum_grad += neg_guidance_weights[:, i].view(
-                    -1, 1, 1, 1
-                ) * perpendicular_component(e_i_neg, e_pos)
-
-            noise_pred = noise_pred_uncond + self.cfg.guidance_scale * (
-                e_pos + accum_grad
-            )
-        else:
-            neg_guidance_weights = None
-            text_embeddings = prompt_utils.get_text_embeddings(
-                elevation, azimuth, camera_distances, self.cfg.view_dependent_prompting
-            )
-            # predict the noise residual with unet, NO grad!
-            with torch.no_grad():
-                # add noise
-                noise = torch.randn_like(latents)  # TODO: use torch generator
-                latents_noisy = self.scheduler.add_noise(latents, noise, t)
-                # pred noise
-                latent_model_input = torch.cat([latents_noisy] * 2, dim=0)
-                noise_pred = self.forward_unet(
-                    latent_model_input,
-                    torch.cat([t] * 2),
-                    encoder_hidden_states=text_embeddings,
-                )
-
-            # perform guidance (high scale from paper!)
-            noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
-            noise_pred = noise_pred_text + self.cfg.guidance_scale * (
-                noise_pred_text - noise_pred_uncond
-            )
+        # perform guidance (high scale from paper!)
+        noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
+        noise_pred = noise_pred_text + self.cfg.guidance_scale * (
+            noise_pred_text - noise_pred_uncond
+        )
 
         if self.cfg.weighting_strategy == "sds":
             # w(t), sigma_t^2
@@ -263,124 +204,53 @@ class StableDiffusionGuidance(BaseObject):
             )
 
         grad = w * (noise_pred - noise)
-
-        guidance_eval_utils = {
-            "use_perp_neg": prompt_utils.use_perp_neg,
-            "neg_guidance_weights": neg_guidance_weights,
-            "text_embeddings": text_embeddings,
-            "t_orig": t,
-            "latents_noisy": latents_noisy,
-            "noise_pred": noise_pred,
-        }
-
-        return grad, guidance_eval_utils
+        return grad
 
     def compute_grad_sjc(
         self,
         latents: Float[Tensor, "B 4 64 64"],
+        text_embeddings: Float[Tensor, "BB 77 768"],
         t: Int[Tensor, "B"],
-        prompt_utils: PromptProcessorOutput,
-        elevation: Float[Tensor, "B"],
-        azimuth: Float[Tensor, "B"],
-        camera_distances: Float[Tensor, "B"],
     ):
-        batch_size = elevation.shape[0]
-
         sigma = self.us[t]
         sigma = sigma.view(-1, 1, 1, 1)
+        # predict the noise residual with unet, NO grad!
+        with torch.no_grad():
+            # add noise
+            noise = torch.randn_like(latents)  # TODO: use torch generator
+            y = latents
 
-        if prompt_utils.use_perp_neg:
-            (
-                text_embeddings,
-                neg_guidance_weights,
-            ) = prompt_utils.get_text_embeddings_perp_neg(
-                elevation, azimuth, camera_distances, self.cfg.view_dependent_prompting
+            zs = y + sigma * noise
+            scaled_zs = zs / torch.sqrt(1 + sigma**2)
+
+            # pred noise
+            latent_model_input = torch.cat([scaled_zs] * 2, dim=0)
+            noise_pred = self.forward_unet(
+                latent_model_input,
+                torch.cat([t] * 2),
+                encoder_hidden_states=text_embeddings,
             )
-            with torch.no_grad():
-                noise = torch.randn_like(latents)
-                y = latents
-                zs = y + sigma * noise
-                scaled_zs = zs / torch.sqrt(1 + sigma**2)
-                # pred noise
-                latent_model_input = torch.cat([scaled_zs] * 4, dim=0)
-                noise_pred = self.forward_unet(
-                    latent_model_input,
-                    torch.cat([t] * 4),
-                    encoder_hidden_states=text_embeddings,
-                )  # (4B, 3, 64, 64)
 
-            noise_pred_text = noise_pred[:batch_size]
-            noise_pred_uncond = noise_pred[batch_size : batch_size * 2]
-            noise_pred_neg = noise_pred[batch_size * 2 :]
-
-            e_pos = noise_pred_text - noise_pred_uncond
-            accum_grad = 0
-            n_negative_prompts = neg_guidance_weights.shape[-1]
-            for i in range(n_negative_prompts):
-                e_i_neg = noise_pred_neg[i::n_negative_prompts] - noise_pred_uncond
-                accum_grad += neg_guidance_weights[:, i].view(
-                    -1, 1, 1, 1
-                ) * perpendicular_component(e_i_neg, e_pos)
-
-            noise_pred = noise_pred_uncond + self.cfg.guidance_scale * (
-                e_pos + accum_grad
+            # perform guidance (high scale from paper!)
+            noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
+            noise_pred = noise_pred_text + self.cfg.guidance_scale * (
+                noise_pred_text - noise_pred_uncond
             )
-        else:
-            neg_guidance_weights = None
-            text_embeddings = prompt_utils.get_text_embeddings(
-                elevation, azimuth, camera_distances, self.cfg.view_dependent_prompting
-            )
-            # predict the noise residual with unet, NO grad!
-            with torch.no_grad():
-                # add noise
-                noise = torch.randn_like(latents)  # TODO: use torch generator
-                y = latents
 
-                zs = y + sigma * noise
-                scaled_zs = zs / torch.sqrt(1 + sigma**2)
+            Ds = zs - sigma * noise_pred
 
-                # pred noise
-                latent_model_input = torch.cat([scaled_zs] * 2, dim=0)
-                noise_pred = self.forward_unet(
-                    latent_model_input,
-                    torch.cat([t] * 2),
-                    encoder_hidden_states=text_embeddings,
-                )
+            if self.cfg.var_red:
+                grad = -(Ds - y) / sigma
+            else:
+                grad = -(Ds - zs) / sigma
 
-                # perform guidance (high scale from paper!)
-                noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
-                noise_pred = noise_pred_text + self.cfg.guidance_scale * (
-                    noise_pred_text - noise_pred_uncond
-                )
-
-        Ds = zs - sigma * noise_pred
-
-        if self.cfg.var_red:
-            grad = -(Ds - y) / sigma
-        else:
-            grad = -(Ds - zs) / sigma
-
-        guidance_eval_utils = {
-            "use_perp_neg": prompt_utils.use_perp_neg,
-            "neg_guidance_weights": neg_guidance_weights,
-            "text_embeddings": text_embeddings,
-            "t_orig": t,
-            "latents_noisy": scaled_zs,
-            "noise_pred": noise_pred,
-        }
-
-        return grad, guidance_eval_utils
+        return grad
 
     def __call__(
         self,
         rgb: Float[Tensor, "B H W C"],
-        prompt_utils: PromptProcessorOutput,
-        elevation: Float[Tensor, "B"],
-        azimuth: Float[Tensor, "B"],
-        camera_distances: Float[Tensor, "B"],
+        text_embeddings: Float[Tensor, "BB 77 768"],
         rgb_as_latents=False,
-        guidance_eval=False,
-        **kwargs,
     ):
         batch_size = rgb.shape[0]
 
@@ -407,13 +277,9 @@ class StableDiffusionGuidance(BaseObject):
         )
 
         if self.cfg.use_sjc:
-            grad, guidance_eval_utils = self.compute_grad_sjc(
-                latents, t, prompt_utils, elevation, azimuth, camera_distances
-            )
+            grad = self.compute_grad_sjc(latents, text_embeddings, t)
         else:
-            grad, guidance_eval_utils = self.compute_grad_sds(
-                latents, t, prompt_utils, elevation, azimuth, camera_distances
-            )
+            grad = self.compute_grad_sds(latents, text_embeddings, t)
 
         grad = torch.nan_to_num(grad)
         # clip grad for stable training?
@@ -424,158 +290,11 @@ class StableDiffusionGuidance(BaseObject):
         # SpecifyGradient is not straghtforward, use a reparameterization trick instead
         target = (latents - grad).detach()
         # d(loss)/d(latents) = latents - target = latents - (latents - grad) = grad
-        loss_sds = 0.5 * F.mse_loss(latents, target, reduction="sum") / batch_size
-
-        guidance_out = {
-            "loss_sds": loss_sds,
-            "grad_norm": grad.norm(),
-            "min_step": self.min_step,
-            "max_step": self.max_step,
-        }
-
-        if guidance_eval:
-            guidance_eval_out = self.guidance_eval(**guidance_eval_utils)
-            texts = []
-            for n, e, a, c in zip(
-                guidance_eval_out["noise_levels"], elevation, azimuth, camera_distances
-            ):
-                texts.append(
-                    f"n{n:.02f}\ne{e.item():.01f}\na{a.item():.01f}\nc{c.item():.02f}"
-                )
-            guidance_eval_out.update({"texts": texts})
-            guidance_out.update({"eval": guidance_eval_out})
-
-        return guidance_out
-
-    @torch.cuda.amp.autocast(enabled=False)
-    @torch.no_grad()
-    def get_noise_pred(
-        self,
-        latents_noisy,
-        t,
-        text_embeddings,
-        use_perp_neg=False,
-        neg_guidance_weights=None,
-    ):
-        batch_size = latents_noisy.shape[0]
-
-        if use_perp_neg:
-            # pred noise
-            latent_model_input = torch.cat([latents_noisy] * 4, dim=0)
-            noise_pred = self.forward_unet(
-                latent_model_input,
-                torch.cat([t.reshape(1)] * 4).to(self.device),
-                encoder_hidden_states=text_embeddings,
-            )  # (4B, 3, 64, 64)
-
-            noise_pred_text = noise_pred[:batch_size]
-            noise_pred_uncond = noise_pred[batch_size : batch_size * 2]
-            noise_pred_neg = noise_pred[batch_size * 2 :]
-
-            e_pos = noise_pred_text - noise_pred_uncond
-            accum_grad = 0
-            n_negative_prompts = neg_guidance_weights.shape[-1]
-            for i in range(n_negative_prompts):
-                e_i_neg = noise_pred_neg[i::n_negative_prompts] - noise_pred_uncond
-                accum_grad += neg_guidance_weights[:, i].view(
-                    -1, 1, 1, 1
-                ) * perpendicular_component(e_i_neg, e_pos)
-
-            noise_pred = noise_pred_uncond + self.cfg.guidance_scale * (
-                e_pos + accum_grad
-            )
-        else:
-            # pred noise
-            latent_model_input = torch.cat([latents_noisy] * 2, dim=0)
-            noise_pred = self.forward_unet(
-                latent_model_input,
-                torch.cat([t.reshape(1)] * 2).to(self.device),
-                encoder_hidden_states=text_embeddings,
-            )
-            # perform guidance (high scale from paper!)
-            noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
-            noise_pred = noise_pred_text + self.cfg.guidance_scale * (
-                noise_pred_text - noise_pred_uncond
-            )
-
-        return noise_pred
-
-    @torch.cuda.amp.autocast(enabled=False)
-    @torch.no_grad()
-    def guidance_eval(
-        self,
-        t_orig,
-        text_embeddings,
-        latents_noisy,
-        noise_pred,
-        use_perp_neg=False,
-        neg_guidance_weights=None,
-    ):
-        # use only 50 timesteps, and find nearest of those to t
-        self.scheduler.set_timesteps(50)
-        self.scheduler.timesteps_gpu = self.scheduler.timesteps.to(self.device)
-        bs = (
-            min(self.cfg.max_items_eval, latents_noisy.shape[0])
-            if self.cfg.max_items_eval > 0
-            else latents_noisy.shape[0]
-        )  # batch size
-        large_enough_idxs = self.scheduler.timesteps_gpu.expand([bs, -1]) > t_orig[
-            :bs
-        ].unsqueeze(
-            -1
-        )  # sized [bs,50] > [bs,1]
-        idxs = torch.min(large_enough_idxs, dim=1)[1]
-        t = self.scheduler.timesteps_gpu[idxs]
-
-        fracs = list((t / self.scheduler.config.num_train_timesteps).cpu().numpy())
-        imgs_noisy = self.decode_latents(latents_noisy[:bs]).permute(0, 2, 3, 1)
-
-        # get prev latent
-        latents_1step = []
-        pred_1orig = []
-        for b in range(bs):
-            step_output = self.scheduler.step(
-                noise_pred[b : b + 1], t[b], latents_noisy[b : b + 1], eta=1
-            )
-            latents_1step.append(step_output["prev_sample"])
-            pred_1orig.append(step_output["pred_original_sample"])
-        latents_1step = torch.cat(latents_1step)
-        pred_1orig = torch.cat(pred_1orig)
-        imgs_1step = self.decode_latents(latents_1step).permute(0, 2, 3, 1)
-        imgs_1orig = self.decode_latents(pred_1orig).permute(0, 2, 3, 1)
-
-        latents_final = []
-        for b, i in enumerate(idxs):
-            latents = latents_1step[b : b + 1]
-            text_emb = (
-                text_embeddings[
-                    [b, b + len(idxs), b + 2 * len(idxs), b + 3 * len(idxs)], ...
-                ]
-                if use_perp_neg
-                else text_embeddings[[b, b + len(idxs)], ...]
-            )
-            neg_guid = neg_guidance_weights[b : b + 1] if use_perp_neg else None
-            for t in tqdm(self.scheduler.timesteps[i + 1 :], leave=False):
-                # pred noise
-                noise_pred = self.get_noise_pred(
-                    latents, t, text_emb, use_perp_neg, neg_guid
-                )
-                # get prev latent
-                latents = self.scheduler.step(noise_pred, t, latents, eta=1)[
-                    "prev_sample"
-                ]
-            latents_final.append(latents)
-
-        latents_final = torch.cat(latents_final)
-        imgs_final = self.decode_latents(latents_final).permute(0, 2, 3, 1)
+        loss = 0.5 * F.mse_loss(latents, target, reduction="sum") / batch_size
 
         return {
-            "bs": bs,
-            "noise_levels": fracs,
-            "imgs_noisy": imgs_noisy,
-            "imgs_1step": imgs_1step,
-            "imgs_1orig": imgs_1orig,
-            "imgs_final": imgs_final,
+            "sds": loss,
+            "grad_norm": grad.norm(),
         }
 
     def update_step(self, epoch: int, global_step: int, on_load_weights: bool = False):
@@ -584,8 +303,3 @@ class StableDiffusionGuidance(BaseObject):
         # http://arxiv.org/abs/2303.15413
         if self.cfg.grad_clip is not None:
             self.grad_clip_val = C(self.cfg.grad_clip, epoch, global_step)
-
-        self.set_min_max_steps(
-            min_step_percent=C(self.cfg.min_step_percent, epoch, global_step),
-            max_step_percent=C(self.cfg.max_step_percent, epoch, global_step),
-        )

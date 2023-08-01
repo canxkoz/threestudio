@@ -22,6 +22,7 @@ class ScoreJacobianChaining(BaseLift3DSystem):
         self.guidance = threestudio.find(self.cfg.guidance_type)(self.cfg.guidance)
 
     def forward(self, batch: Dict[str, Any], decode: bool = False) -> Dict[str, Any]:
+        print(self.geometry)
         render_out = self.renderer(**batch)
         out = {
             **render_out,
@@ -52,17 +53,13 @@ class ScoreJacobianChaining(BaseLift3DSystem):
 
     def training_step(self, batch, batch_idx):
         out = self(batch)
-        prompt_utils = self.prompt_processor()
+        text_embeddings = self.prompt_processor(**batch)
         guidance_out = self.guidance(
-            out["comp_rgb"], prompt_utils, **batch, rgb_as_latents=True
+            out["comp_rgb"], text_embeddings, rgb_as_latents=True
         )
 
         loss = 0.0
-
-        for name, value in guidance_out.items():
-            self.log(f"train/{name}", value)
-            if name.startswith("loss_"):
-                loss += value * self.C(self.cfg.loss[name.replace("loss_", "lambda_")])
+        loss += guidance_out["sds"] * self.C(self.cfg.loss.lambda_sds)
 
         loss_emptiness = (
             self.C(self.cfg.loss.lambda_emptiness)
@@ -147,8 +144,6 @@ class ScoreJacobianChaining(BaseLift3DSystem):
                 },
             ],
             align=512,
-            name="validation_step",
-            step=self.true_global_step,
         )
 
     def on_validation_epoch_end(self):
@@ -184,8 +179,6 @@ class ScoreJacobianChaining(BaseLift3DSystem):
                 },
             ],
             align=512,
-            name="test_step",
-            step=self.true_global_step,
         )
 
     def on_test_epoch_end(self):
@@ -195,6 +188,4 @@ class ScoreJacobianChaining(BaseLift3DSystem):
             "(\d+)\.png",
             save_format="mp4",
             fps=30,
-            name="test",
-            step=self.true_global_step,
         )

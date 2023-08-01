@@ -30,7 +30,7 @@ def get_device():
 
 
 def load_module_weights(
-    path, module_name=None, ignore_modules=None, map_location=None
+    path, module_name=None, ignore_modules=None, map_location=None, return_state=False
 ) -> Tuple[dict, int, int]:
     if module_name is not None and ignore_modules is not None:
         raise ValueError("module_name and ignore_modules cannot be both set")
@@ -110,11 +110,3 @@ def barrier():
         return
     else:
         torch.distributed.barrier()
-
-
-def broadcast(tensor, src=0):
-    if not _distributed_available():
-        return tensor
-    else:
-        torch.distributed.broadcast(tensor, src=src)
-        return tensor

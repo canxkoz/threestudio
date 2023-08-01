@@ -10,32 +10,15 @@ accelerate
 opencv-python
 tensorboard
 matplotlib
-imageio>=2.28.0
+imageio
 imageio[ffmpeg]
+trimesh
 git+https://github.com/NVlabs/nvdiffrast.git
-libigl
-xatlas
-trimesh[easy]
-networkx
-pysdf
-PyMCubes
-wandb
-gradio
-git+https://github.com/ashawkey/envlight.git
-torchmetrics
-
 # deepfloyd
-xformers
+git+https://github.com/facebookresearch/xformers.git@main#egg=xformers
 bitsandbytes
 sentencepiece
 safetensors
 huggingface_hub
-
-# for zero123
-einops
-kornia
-taming-transformers-rom1504
-git+https://github.com/openai/CLIP.git
-
-#controlnet
-controlnet_aux
+libigl
+xatlas

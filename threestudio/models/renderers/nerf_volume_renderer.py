@@ -9,7 +9,10 @@ from threestudio.models.background.base import BaseBackground
 from threestudio.models.geometry.base import BaseImplicitGeometry
 from threestudio.models.materials.base import BaseMaterial
 from threestudio.models.renderers.base import VolumeRenderer
-from threestudio.utils.ops import chunk_batch, validate_empty_rays
+from threestudio.utils.base import BaseModule
+from threestudio.utils.misc import get_device
+from threestudio.utils.ops import chunk_batch
+from threestudio.utils.rasterize import NVDiffRasterizerContext
 from threestudio.utils.typing import *
 
 
@@ -21,9 +24,6 @@ class NeRFVolumeRenderer(VolumeRenderer):
         randomized: bool = True
         eval_chunk_size: int = 160000
         grid_prune: bool = True
-        prune_alpha_threshold: bool = True
-        return_comp_normal: bool = False
-        return_normal_perturb: bool = False
 
     cfg: Config
 
@@ -63,22 +63,6 @@ class NeRFVolumeRenderer(VolumeRenderer):
         )
         n_rays = rays_o_flatten.shape[0]
 
-        def sigma_fn(t_starts, t_ends, ray_indices):
-            t_starts, t_ends = t_starts[..., None], t_ends[..., None]
-            t_origins = rays_o_flatten[ray_indices]
-            t_positions = (t_starts + t_ends) / 2.0
-            t_dirs = rays_d_flatten[ray_indices]
-            positions = t_origins + t_dirs * t_positions
-            if self.training:
-                sigma = self.geometry.forward_density(positions)[..., 0]
-            else:
-                sigma = chunk_batch(
-                    self.geometry.forward_density,
-                    self.cfg.eval_chunk_size,
-                    positions,
-                )[..., 0]
-            return sigma
-
         if not self.cfg.grid_prune:
             with torch.no_grad():
                 ray_indices, t_starts_, t_ends_ = self.estimator.sampling(
@@ -96,16 +80,13 @@ class NeRFVolumeRenderer(VolumeRenderer):
                 ray_indices, t_starts_, t_ends_ = self.estimator.sampling(
                     rays_o_flatten,
                     rays_d_flatten,
-                    sigma_fn=sigma_fn if self.cfg.prune_alpha_threshold else None,
+                    sigma_fn=None,
                     render_step_size=self.render_step_size,
-                    alpha_thre=0.01 if self.cfg.prune_alpha_threshold else 0.0,
+                    alpha_thre=0.0,
                     stratified=self.randomized,
                     cone_angle=0.0,
                 )
 
-        ray_indices, t_starts_, t_ends_ = validate_empty_rays(
-            ray_indices, t_starts_, t_ends_
-        )
         ray_indices = ray_indices.long()
         t_starts, t_ends = t_starts_[..., None], t_ends_[..., None]
         t_origins = rays_o_flatten[ray_indices]
@@ -114,6 +95,8 @@ class NeRFVolumeRenderer(VolumeRenderer):
         t_positions = (t_starts + t_ends) / 2.0
         positions = t_origins + t_dirs * t_positions
         t_intervals = t_ends - t_starts
+
+        # TODO: still proceed if the scene is empty
 
         if self.training:
             geo_out = self.geometry(
@@ -126,7 +109,7 @@ class NeRFVolumeRenderer(VolumeRenderer):
                 **geo_out,
                 **kwargs
             )
-            comp_rgb_bg = self.background(dirs=rays_d)
+            comp_rgb_bg = self.background(dirs=rays_d_flatten)
         else:
             geo_out = chunk_batch(
                 self.geometry,
@@ -143,7 +126,7 @@ class NeRFVolumeRenderer(VolumeRenderer):
                 **geo_out
             )
             comp_rgb_bg = chunk_batch(
-                self.background, self.cfg.eval_chunk_size, dirs=rays_d
+                self.background, self.cfg.eval_chunk_size, dirs=rays_d_flatten
             )
 
         weights: Float[Tensor, "Nr 1"]
@@ -165,27 +148,11 @@ class NeRFVolumeRenderer(VolumeRenderer):
             weights[..., 0], values=rgb_fg_all, ray_indices=ray_indices, n_rays=n_rays
         )
 
-        # populate depth and opacity to each point
-        t_depth = depth[ray_indices]
-        z_variance = nerfacc.accumulate_along_rays(
-            weights[..., 0],
-            values=(t_positions - t_depth) ** 2,
-            ray_indices=ray_indices,
-            n_rays=n_rays,
-        )
-
         if bg_color is None:
             bg_color = comp_rgb_bg
         else:
-            if bg_color.shape[:-1] == (batch_size,):
-                # e.g. constant random color used for Zero123
-                # [bs,3] -> [bs, 1, 1, 3]):
-                bg_color = bg_color.unsqueeze(1).unsqueeze(1)
-                #        -> [bs, height, width, 3]):
-                bg_color = bg_color.expand(-1, height, width, -1)
-
-        if bg_color.shape[:-1] == (batch_size, height, width):
-            bg_color = bg_color.reshape(batch_size * height * width, -1)
+            if bg_color.shape == (batch_size, height, width, 3):
+                bg_color = bg_color.reshape(-1, 3)
 
         comp_rgb = comp_rgb_fg + bg_color * (1.0 - opacity)
 
@@ -195,7 +162,6 @@ class NeRFVolumeRenderer(VolumeRenderer):
             "comp_rgb_bg": comp_rgb_bg.view(batch_size, height, width, -1),
             "opacity": opacity.view(batch_size, height, width, 1),
             "depth": depth.view(batch_size, height, width, 1),
-            "z_variance": z_variance.view(batch_size, height, width, 1),
         }
 
         if self.training:
@@ -210,34 +176,9 @@ class NeRFVolumeRenderer(VolumeRenderer):
                     **geo_out,
                 }
             )
-            if "normal" in geo_out:
-                if self.cfg.return_comp_normal:
-                    comp_normal: Float[Tensor, "Nr 3"] = nerfacc.accumulate_along_rays(
-                        weights[..., 0],
-                        values=geo_out["normal"],
-                        ray_indices=ray_indices,
-                        n_rays=n_rays,
-                    )
-                    comp_normal = F.normalize(comp_normal, dim=-1)
-                    comp_normal = (
-                        (comp_normal + 1.0) / 2.0 * opacity
-                    )  # for visualization
-                    out.update(
-                        {
-                            "comp_normal": comp_normal.view(
-                                batch_size, height, width, 3
-                            ),
-                        }
-                    )
-                if self.cfg.return_normal_perturb:
-                    normal_perturb = self.geometry(
-                        positions + torch.randn_like(positions) * 1e-2,
-                        output_normal=self.material.requires_normal,
-                    )["normal"]
-                    out.update({"normal_perturb": normal_perturb})
         else:
             if "normal" in geo_out:
-                comp_normal = nerfacc.accumulate_along_rays(
+                comp_normal: Float[Tensor, "Nr 3"] = nerfacc.accumulate_along_rays(
                     weights[..., 0],
                     values=geo_out["normal"],
                     ray_indices=ray_indices,

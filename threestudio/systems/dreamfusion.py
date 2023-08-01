@@ -36,17 +36,14 @@ class DreamFusion(BaseLift3DSystem):
 
     def training_step(self, batch, batch_idx):
         out = self(batch)
-        prompt_utils = self.prompt_processor()
+        text_embeddings = self.prompt_processor(**batch)
         guidance_out = self.guidance(
-            out["comp_rgb"], prompt_utils, **batch, rgb_as_latents=False
+            out["comp_rgb"], text_embeddings, rgb_as_latents=False
         )
 
         loss = 0.0
 
-        for name, value in guidance_out.items():
-            self.log(f"train/{name}", value)
-            if name.startswith("loss_"):
-                loss += value * self.C(self.cfg.loss[name.replace("loss_", "lambda_")])
+        loss += guidance_out["sds"] * self.C(self.cfg.loss.lambda_sds)
 
         if self.C(self.cfg.loss.lambda_orient) > 0:
             if "normal" not in out:
@@ -103,8 +100,6 @@ class DreamFusion(BaseLift3DSystem):
                     "kwargs": {"cmap": None, "data_range": (0, 1)},
                 },
             ],
-            name="validation_step",
-            step=self.true_global_step,
         )
 
     def on_validation_epoch_end(self):
@@ -139,8 +134,6 @@ class DreamFusion(BaseLift3DSystem):
                     "kwargs": {"cmap": None, "data_range": (0, 1)},
                 },
             ],
-            name="test_step",
-            step=self.true_global_step,
         )
 
     def on_test_epoch_end(self):
@@ -150,6 +143,4 @@ class DreamFusion(BaseLift3DSystem):
             "(\d+)\.png",
             save_format="mp4",
             fps=30,
-            name="test",
-            step=self.true_global_step,
         )

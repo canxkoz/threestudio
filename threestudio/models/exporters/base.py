@@ -50,10 +50,3 @@ class Exporter(BaseObject):
 
     def __call__(self, *args, **kwargs) -> List[ExporterOutput]:
         raise NotImplementedError
-
-
-@threestudio.register("dummy-exporter")
-class DummyExporter(Exporter):
-    def __call__(self, *args, **kwargs) -> List[ExporterOutput]:
-        # DummyExporter does not export anything
-        return []

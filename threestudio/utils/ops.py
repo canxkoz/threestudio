@@ -8,7 +8,6 @@ from igl import fast_winding_number_for_meshes, point_mesh_squared_distance, rea
 from torch.autograd import Function
 from torch.cuda.amp import custom_bwd, custom_fwd
 
-import threestudio
 from threestudio.utils.typing import *
 
 
@@ -122,8 +121,7 @@ def chunk_batch(func: Callable, chunk_size: int, *args, **kwargs) -> Any:
     ), "No tensor found in args or kwargs, cannot determine batch size."
     out = defaultdict(list)
     out_type = None
-    # max(1, B) to support B == 0
-    for i in range(0, max(1, B), chunk_size):
+    for i in range(0, B, chunk_size):
         out_chunk = func(
             *[
                 arg[i : i + chunk_size] if isinstance(arg, torch.Tensor) else arg
@@ -218,7 +216,7 @@ def get_ray_directions(
 
 def get_rays(
     directions: Float[Tensor, "... 3"],
-    c2w: Float[Tensor, "... 4 4"],
+    c2w: Float[Tensor, "... 3 4"],
     keepdim=False,
     noise_scale=0.0,
 ) -> Tuple[Float[Tensor, "... 3"], Float[Tensor, "... 3"]]:
@@ -230,25 +228,25 @@ def get_rays(
             c2w = c2w[None, :, :]
         assert c2w.ndim == 3  # (N_rays, 4, 4) or (1, 4, 4)
         rays_d = (directions[:, None, :] * c2w[:, :3, :3]).sum(-1)  # (N_rays, 3)
-        rays_o = c2w[:, :3, 3].expand(rays_d.shape)
+        rays_o = c2w[:, :, 3].expand(rays_d.shape)
     elif directions.ndim == 3:  # (H, W, 3)
         assert c2w.ndim in [2, 3]
         if c2w.ndim == 2:  # (4, 4)
             rays_d = (directions[:, :, None, :] * c2w[None, None, :3, :3]).sum(
                 -1
             )  # (H, W, 3)
-            rays_o = c2w[None, None, :3, 3].expand(rays_d.shape)
+            rays_o = c2w[None, None, :, 3].expand(rays_d.shape)
         elif c2w.ndim == 3:  # (B, 4, 4)
             rays_d = (directions[None, :, :, None, :] * c2w[:, None, None, :3, :3]).sum(
                 -1
             )  # (B, H, W, 3)
-            rays_o = c2w[:, None, None, :3, 3].expand(rays_d.shape)
+            rays_o = c2w[:, None, None, :, 3].expand(rays_d.shape)
     elif directions.ndim == 4:  # (B, H, W, 3)
         assert c2w.ndim == 3  # (B, 4, 4)
         rays_d = (directions[:, :, :, None, :] * c2w[:, None, None, :3, :3]).sum(
             -1
         )  # (B, H, W, 3)
-        rays_o = c2w[:, None, None, :3, 3].expand(rays_d.shape)
+        rays_o = c2w[:, None, None, :, 3].expand(rays_d.shape)
 
     # add camera noise to avoid grid-like artifect
     # https://github.com/ashawkey/stable-dreamfusion/blob/49c3d4fa01d68a4f027755acf94e1ff6020458cc/nerf/utils.py#L373
@@ -279,7 +277,7 @@ def get_projection_matrix(
 
 
 def get_mvp_matrix(
-    c2w: Float[Tensor, "B 4 4"], proj_mtx: Float[Tensor, "B 4 4"]
+    c2w: Float[Tensor, "B 3 4"], proj_mtx: Float[Tensor, "B 4 4"]
 ) -> Float[Tensor, "B 4 4"]:
     # calculate w2c from c2w: R' = Rt, t' = -Rt * t
     # mathematically equivalent to (c2w)^-1
@@ -333,7 +331,9 @@ class MeshOBJ:
 
         e1 = vf[:, 1, :] - vf[:, 0, :]
         e2 = vf[:, 2, :] - vf[:, 0, :]
-        self.face_normals = np.cross(e1, e2)
+        print(e1.shape)
+        print(e2.shape)
+        self.face_normals = np.cross(e1[:,0:3], e2[:,0:3])
         self.face_normals = (
             self.face_normals / np.linalg.norm(self.face_normals, axis=-1)[:, None]
         )
@@ -418,33 +418,3 @@ class ShapeLoss(nn.Module):
             nerf_occ, indicator, weight=weight
         )  # order is important for CE loss + second argument may not be optimized
         return loss
-
-
-def shifted_expotional_decay(a, b, c, r):
-    return a * torch.exp(-b * r) + c
-
-
-def shifted_cosine_decay(a, b, c, r):
-    return a * torch.cos(b * r + c) + a
-
-
-def perpendicular_component(x: Float[Tensor, "B C H W"], y: Float[Tensor, "B C H W"]):
-    # get the component of x that is perpendicular to y
-    eps = torch.ones_like(x[:, 0, 0, 0]) * 1e-6
-    return (
-        x
-        - (
-            torch.mul(x, y).sum(dim=[1, 2, 3])
-            / torch.maximum(torch.mul(y, y).sum(dim=[1, 2, 3]), eps)
-        ).view(-1, 1, 1, 1)
-        * y
-    )
-
-
-def validate_empty_rays(ray_indices, t_start, t_end):
-    if ray_indices.nelement() == 0:
-        threestudio.warn("Empty rays_indices!")
-        ray_indices = torch.LongTensor([0]).to(ray_indices)
-        t_start = torch.Tensor([0]).to(ray_indices)
-        t_end = torch.Tensor([0]).to(ray_indices)
-    return ray_indices, t_start, t_end

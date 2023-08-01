@@ -17,7 +17,6 @@ class BaseMaterial(BaseModule):
 
     cfg: Config
     requires_normal: bool = False
-    requires_tangent: bool = False
 
     def configure(self):
         pass

@@ -6,17 +6,12 @@ seed: 0
 data_type: "single-image-datamodule"
 data:
   image_path: ./load/images/hamburger_rgba.png
-  requires_depth: ${cmaxgt0orcmaxgt0:${system.loss.lambda_depth},${system.loss.lambda_depth_rel}}
-  requires_normal: ${cmaxgt0:${system.loss.lambda_normal}}
   random_camera:
-    batch_size: 4
     eval_height: 256
     eval_width: 256
     eval_elevation_deg: 0.
     eval_camera_distance: 1.2
     eval_fovy_deg: 60.
-    n_val_views: 30
-    n_test_views: 120
 
 system_type: "image-condition-dreamfusion-system"
 system:
@@ -66,39 +61,17 @@ system:
   guidance:
     pretrained_model_name_or_path: "runwayml/stable-diffusion-v1-5"
     guidance_scale: 100.
-    weighting_strategy: sds # sds, uniform, fantasia3d
-
-  # prompt_processor_type: "deep-floyd-prompt-processor"
-  # prompt_processor:
-  #   pretrained_model_name_or_path: "DeepFloyd/IF-I-XL-v1.0"
-  #   prompt: "a DSLR photo of a delicious hamburger"
-
-  # guidance_type: "deep-floyd-guidance"
-  # guidance:
-  #   pretrained_model_name_or_path: "DeepFloyd/IF-I-XL-v1.0"
-  #   guidance_scale: 20.
-  #   weighting_strategy: sds # sds, uniform, fantasia3d
 
   freq:
     n_ref: 2
     ref_only_steps: 100
-    guidance_eval: 0
-
-  loggers:
-    wandb:
-      enable: false
-      project: 'threestudio'
-      name: None
 
   loss:
     lambda_sds: 0.1
     lambda_rgb: 10.
     lambda_mask: 1.
     lambda_depth: [0.0, 0.0, 1.0, 10000]
-    lambda_depth_rel: [0.0, 0.0, 1.0, 10000]
-    lambda_normal: 0. # [0, 0, 0.05, 100]
     lambda_normal_smooth: 0.0
-    lambda_3d_normal_smooth: 0.0
     lambda_orient: 0.0
     lambda_sparsity: 0.0
     lambda_opaque: 0.0
@@ -124,7 +97,7 @@ trainer:
   max_steps: 10000
   log_every_n_steps: 1
   num_sanity_val_steps: 0
-  val_check_interval: 100
+  val_check_interval: 500
   limit_val_batches: 6
   enable_progress_bar: true
   precision: 16-mixed
